@@ -1,4 +1,4 @@
-#compdef conda mamba micromamba
+#compdef conda
 #description:conda package manager
 #
 # ZSH Completion for conda (http://conda.pydata.org/)
@@ -9,8 +9,9 @@
 # Homepage: https://github.com/conda-incubator/conda-zsh-completion
 # Demo: https://asciinema.org/a/16516
 #
-# This completion depends on Python for a json parser, sorry. Unfortunately
-# there is no such thing in zsh (yet).
+# JSON parsing is provided by a trimmed, query-oriented copy of JSON.sh
+# (https://github.com/dominictarr/JSON.sh) embedded below, so no Python
+# interpreter is needed.
 #
 # To use this completion, install it somewhere on your hard drive:
 #
@@ -98,6 +99,9 @@
 #
 #    * update conda search completion (#62 esc)
 #    * Conda info: removed arg package (#61 Hanspe-3019)
+#    * Replace the Python JSON parser with an embedded trimmed copy of JSON.sh.
+#    * Use -eq for numeric tests, which zsh's EQUALS option otherwise breaks.
+#    * Cache version completions and harden JSON query handling.
 #
 # * v0.11
 #
@@ -185,21 +189,382 @@
 # * None of the commands are aware of channels
 
 local state line context
+local curcontext="$curcontext"
 local -A opt_args
 
+# ---------------------------------------------------------------------------
+# Embedded JSON parser
+#
+# The functions below are a trimmed, query-aware adaptation of JSON.sh
+# (https://github.com/dominictarr/JSON.sh), Copyright (c) 2011 Dominic Tarr,
+# available under the MIT licence (see LICENSE.JSON.sh.txt).  JSON.sh prints
+# every path/value pair; this completion only needs four small queries, so the
+# output side of the parser is reduced to those queries.  The tokenizer and
+# recursive-descent parser are otherwise kept equivalent, so the conda --json
+# payloads accepted here are the same ones Python's json module used to get.
+#
+# __conda_json_query MODE [QUERY] reads JSON from stdin and prints:
+#
+#   object-keys        keys of the root object (conda search package names)
+#   config-keys        keys of the "get" object (conda config keys)
+#   config-values K    values in the get[K] array (config list values)
+#   package-versions P unique "version" values in the P array
+#
+# Results are buffered until the whole document has parsed successfully,
+# matching json.load(): invalid JSON produces no partial output.
+# ---------------------------------------------------------------------------
+
+# Report a parse error without exiting: this parser runs inside the user's
+# completion shell, where exit would close the shell.
+__conda_json_error() {
+    print -u2 -r -- "$*"
+    return 1
+}
+
+# Split JSON into one token per line.  This is JSON.sh's tokenizer with the
+# "grep -o is unavailable" awk fallback removed.  The regexes are unchanged.
+__conda_json_tokenize() {
+    emulate -L zsh
+    local ESCAPE CHAR STRING NUMBER KEYWORD SPACE
+    local -a grep_cmd
+
+    if print -r -- "test string" |
+        command grep -Eao --color=never "test" >/dev/null 2>&1; then
+        grep_cmd=(command grep -Eao --color=never)
+    else
+        grep_cmd=(command grep -Eao)
+    fi
+
+    ESCAPE='(\\[^u[:cntrl:]]|\\u[0-9a-fA-F]{4})'
+    CHAR='[^[:cntrl:]"\\]'
+    STRING="\"$CHAR*($ESCAPE$CHAR*)*\""
+    NUMBER='-?(0|[1-9][0-9]*)([.][0-9]*)?([eE][+-]?[0-9]*)?'
+    KEYWORD='null|false|true'
+    SPACE='[[:space:]]+'
+
+    "${grep_cmd[@]}" "$STRING|$NUMBER|$KEYWORD|$SPACE|." |
+        command grep -Ev "^$SPACE$"
+}
+
+# Decode one JSON value token into __conda_json_decoded.  Most conda names
+# contain no backslashes and take the fast path; the slow path handles JSON
+# escapes, including surrogate pairs.  true/false/null are converted the way
+# Python's print() would print them.
+__conda_json_decode_value() {
+    local s=$1
+    case $s in
+        (true) __conda_json_decoded=True; return ;;
+        (false) __conda_json_decoded=False; return ;;
+        (null) __conda_json_decoded=None; return ;;
+    esac
+    if [[ $s != \"*\" ]]; then
+        __conda_json_decoded=$s
+        return
+    fi
+    s=${s[2,-2]}
+    if [[ $s != *\\* ]]; then
+        __conda_json_decoded=$s
+        return
+    fi
+
+    local out='' hex code low
+    while [[ $s == *\\* ]]; do
+        out+=${s%%\\*}
+        s=${s#*\\}
+        case $s in
+            (\"*) out+='"' ; s=${s[2,-1]} ;;
+            (\\*) out+='\' ; s=${s[2,-1]} ;;
+            (/*) out+='/' ; s=${s[2,-1]} ;;
+            (b*) out+=$'\b' ; s=${s[2,-1]} ;;
+            (f*) out+=$'\f' ; s=${s[2,-1]} ;;
+            (n*) out+=$'\n' ; s=${s[2,-1]} ;;
+            (r*) out+=$'\r' ; s=${s[2,-1]} ;;
+            (t*) out+=$'\t' ; s=${s[2,-1]} ;;
+            (u[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*)
+                hex=${s[2,5]}
+                s=${s[6,-1]}
+                code=$((16#$hex))
+                if (( code >= 0xD800 && code <= 0xDBFF )) &&
+                   [[ $s == \\u[Dd][C-Fc-f][0-9A-Fa-f][0-9A-Fa-f]* ]]; then
+                    low=${s[3,6]}
+                    code=$((0x10000 + ((code - 0xD800) << 10) +
+                        (16#$low - 0xDC00)))
+                    s=${s[7,-1]}
+                fi
+                # Keep command substitution from eating a decoded newline
+                # when the escape is \u000a.
+                out+="$(__conda_json_unicode "$code"; print -n .)"
+                out=${out%.}
+                ;;
+            (*) out+="\\$s" ; s='' ;;
+        esac
+    done
+    out+=$s
+    __conda_json_decoded=$out
+}
+
+__conda_json_hexbyte() {
+    printf '\\x%02x' "$1"
+}
+
+__conda_json_unicode() {
+    local code=$1
+    local b1 b2 b3 b4 out
+    # Encode UTF-8 explicitly instead of relying on printf's \u/\U support,
+    # which is locale-dependent (e.g. it fails in the C locale).
+    if (( code < 0x80 )); then
+        out="$(__conda_json_hexbyte "$code")"
+    elif (( code < 0x800 )); then
+        b1=$((0xC0 | (code >> 6)))
+        b2=$((0x80 | (code & 0x3F)))
+        out="$(__conda_json_hexbyte "$b1")"
+        out+="$(__conda_json_hexbyte "$b2")"
+    elif (( code < 0x10000 )); then
+        b1=$((0xE0 | (code >> 12)))
+        b2=$((0x80 | ((code >> 6) & 0x3F)))
+        b3=$((0x80 | (code & 0x3F)))
+        out="$(__conda_json_hexbyte "$b1")"
+        out+="$(__conda_json_hexbyte "$b2")"
+        out+="$(__conda_json_hexbyte "$b3")"
+    else
+        b1=$((0xF0 | (code >> 18)))
+        b2=$((0x80 | ((code >> 12) & 0x3F)))
+        b3=$((0x80 | ((code >> 6) & 0x3F)))
+        b4=$((0x80 | (code & 0x3F)))
+        out="$(__conda_json_hexbyte "$b1")"
+        out+="$(__conda_json_hexbyte "$b2")"
+        out+="$(__conda_json_hexbyte "$b3")"
+        out+="$(__conda_json_hexbyte "$b4")"
+    fi
+    printf '%b' "$out"
+}
+
+# Record a decoded object key.  The current path and mode are provided by
+# __conda_json_parse's dynamically scoped locals.
+__conda_json_select_key() {
+    case $__conda_json_mode in
+        (object-keys)
+            if (( __conda_json_depth == 0 )) && [[ -n $1 ]]; then
+                __conda_json_results+=("$1")
+            fi
+            ;;
+        (config-keys)
+            if (( __conda_json_depth == 1 )) &&
+                [[ $__conda_json_path[1] == "get" ]] &&
+                [[ -n $1 ]]; then
+                __conda_json_results+=("$1")
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# Record a scalar value for the requested query.  Path components are decoded
+# strings, so package/config names containing quotes, backslashes or Unicode
+# are matched correctly.
+__conda_json_select_value() {
+    local token=$1
+    case $__conda_json_mode in
+        (object-keys)
+            # A conda error object has a root "error" string.  Do not offer
+            # its diagnostic keys as package names.
+            if (( __conda_json_depth == 1 )) &&
+                [[ $token == \"* ]] &&
+                [[ $__conda_json_path[1] == "error" ||
+                   $__conda_json_path[1] == "exception_name" ]]; then
+                __conda_json_conda_error=1
+            fi
+            ;;
+        (config-values)
+            if (( __conda_json_depth == 3 )) &&
+                [[ $__conda_json_path[1] == "get" ]] &&
+                [[ $__conda_json_path[2] == "$__conda_json_query" ]]; then
+                __conda_json_decode_value "$token"
+                if [[ -n $__conda_json_decoded ]]; then
+                    __conda_json_results+=("$__conda_json_decoded")
+                fi
+            fi
+            ;;
+        (package-versions)
+            if (( __conda_json_depth == 3 )) &&
+                [[ $__conda_json_path[1] == "$__conda_json_query" ]] &&
+                [[ $__conda_json_path[3] == "version" ]] &&
+                [[ $token == \"* ]]; then
+                __conda_json_decode_value "$token"
+                if [[ -n $__conda_json_decoded ]]; then
+                    __conda_json_results+=("$__conda_json_decoded")
+                fi
+            fi
+            ;;
+    esac
+    return 0
+}
+
+__conda_json_parse_value() {
+    local token=$__conda_json_token ret=0
+    __conda_json_path[++__conda_json_depth]="$1"
+    case $token in
+        ('{') __conda_json_parse_object || ret=1 ;;
+        ('[') __conda_json_parse_array || ret=1 ;;
+        (''|[!0-9]) __conda_json_error \
+            "EXPECTED value GOT ${token:-EOF}" || ret=1 ;;
+        (*) __conda_json_select_value "$token" ;;
+    esac
+    __conda_json_depth=$((__conda_json_depth - 1))
+    return $ret
+}
+
+__conda_json_parse_array() {
+    local index=0
+    read -r __conda_json_token
+    case $__conda_json_token in
+        (']') ;;
+        (*)
+            while :; do
+                __conda_json_parse_value "$index" || return 1
+                index=$((index + 1))
+                read -r __conda_json_token
+                case $__conda_json_token in
+                    (']') break ;;
+                    (',') ;;
+                    (*) __conda_json_error \
+                        "EXPECTED , or ] GOT ${__conda_json_token:-EOF}" ||
+                        return 1 ;;
+                esac
+                read -r __conda_json_token
+            done
+            ;;
+    esac
+    return 0
+}
+
+__conda_json_parse_object() {
+    local key
+    local decode_keys=0 special_version=0
+    case $__conda_json_mode in
+        (object-keys)
+            (( __conda_json_depth == 0 )) && decode_keys=1
+            ;;
+        (config-keys|config-values)
+            (( __conda_json_depth <= 1 )) && decode_keys=1
+            ;;
+        (package-versions)
+            if (( __conda_json_depth == 0 )); then
+                decode_keys=1
+            elif (( __conda_json_depth == 2 )); then
+                special_version=1
+            fi
+            ;;
+    esac
+    read -r __conda_json_token
+    case $__conda_json_token in
+        ('}') ;;
+        (*)
+            while :; do
+                case $__conda_json_token in
+                    ('"'*'"')
+                        if (( special_version )) &&
+                            [[ $__conda_json_token == '"version"' ]]; then
+                            key=version
+                        elif (( decode_keys )); then
+                            __conda_json_decode_value "$__conda_json_token"
+                            key=$__conda_json_decoded
+                        else
+                            key=$__conda_json_token
+                        fi
+                        ;;
+                    (*) __conda_json_error \
+                        "EXPECTED string GOT ${__conda_json_token:-EOF}" ||
+                        return 1 ;;
+                esac
+                __conda_json_select_key "$key"
+                read -r __conda_json_token
+                case $__conda_json_token in
+                    (':') ;;
+                    (*) __conda_json_error \
+                        "EXPECTED : GOT ${__conda_json_token:-EOF}" ||
+                        return 1 ;;
+                esac
+                read -r __conda_json_token
+                __conda_json_parse_value "$key" || return 1
+                read -r __conda_json_token
+                case $__conda_json_token in
+                    ('}') break ;;
+                    (',') ;;
+                    (*) __conda_json_error \
+                        "EXPECTED , or } GOT ${__conda_json_token:-EOF}" ||
+                        return 1 ;;
+                esac
+                read -r __conda_json_token
+            done
+            ;;
+    esac
+    return 0
+}
+
+__conda_json_parse() {
+    emulate -L zsh
+    local __conda_json_mode=$1 __conda_json_query=$2
+    local __conda_json_token __conda_json_decoded
+    local -a __conda_json_results __conda_json_path
+    local __conda_json_depth=0 __conda_json_conda_error=0
+
+    read -r __conda_json_token
+    case $__conda_json_token in
+        ('{') __conda_json_parse_object || return 1 ;;
+        ('[') __conda_json_parse_array || return 1 ;;
+        (*) __conda_json_parse_value "" || return 1 ;;
+    esac
+    read -r __conda_json_token
+    if [[ -n $__conda_json_token ]]; then
+        __conda_json_error "EXPECTED EOF GOT $__conda_json_token"
+        return 1
+    fi
+    if [[ $__conda_json_mode == object-keys ]] &&
+        (( __conda_json_conda_error )); then
+        return 0
+    fi
+
+    local item
+    if [[ $__conda_json_mode == config-values ]]; then
+        (( ${#__conda_json_results} )) &&
+            print -l -r -- "${__conda_json_results[@]}"
+    else
+        local -A seen
+        for item in "${__conda_json_results[@]}"; do
+            [[ -n ${seen[$item]-} ]] && continue
+            seen[$item]=1
+            print -r -- "$item"
+        done
+    fi
+    return 0
+}
+
+__conda_json_query() {
+    emulate -L zsh
+    __conda_json_tokenize | __conda_json_parse "$1" "$2"
+}
+
+# Query entry points used by the completion functions below.
+__conda_json_object_keys() { __conda_json_query object-keys ; }
+__conda_json_config_keys() { __conda_json_query config-keys ; }
+__conda_json_config_values() { __conda_json_query config-values "$1" ; }
+__conda_json_package_versions() { __conda_json_query package-versions "$1" ; }
+
 __conda_envs(){
-    local -a envs unnamed sort globalfirst localenvs globalenvs
-    local -a conda_path
+    local -a envs localenvs globalenvs
+    local conda_path
     local -a ls_opts
     local -a describe_opts
+    local unnamed=0 sort=0 globalfirst=0
     local localenvspath
     # only parse environments.txt (including unnamed envs) if asked by the user
-    zstyle -s ":conda_zsh_completion:*" show-unnamed unnamed
-    zstyle -s ":conda_zsh_completion:*" sort-envs-by-time sort
-    zstyle -s ":conda_zsh_completion:*" show-global-envs-first globalfirst
+    zstyle -t ":conda_zsh_completion:*" show-unnamed && unnamed=1
+    zstyle -t ":conda_zsh_completion:*" sort-envs-by-time && sort=1
+    zstyle -t ":conda_zsh_completion:*" show-global-envs-first && globalfirst=1
 
     ls_opts=("-1")
-    if test -n "$sort"; then
+    if (( sort )); then
         ls_opts+=("-t")
         describe_opts+=("-V")
     fi
@@ -214,7 +579,8 @@ __conda_envs(){
     fi
 
     # global envs (if exists) and base env.
-    globalenvs=($([[ -d "${conda_path}" ]] && ls $ls_opts ${conda_path}))
+    globalenvs=($([[ -d "$conda_path" ]] &&
+        ls "${ls_opts[@]}" "$conda_path"))
     globalenvs+=("base")
 
     # local envs (if exists).
@@ -225,80 +591,106 @@ __conda_envs(){
     else
         localenvspath="${HOME:?}/.conda/envs"
     fi
-    localenvs=($([[ -d "$localenvspath" ]] && ls $ls_opts "$localenvspath"))
+    localenvs=($([[ -d "$localenvspath" ]] &&
+        ls "${ls_opts[@]}" "$localenvspath"))
 
-    if test -n "$globalfirst"; then
-        envs=($globalenvs $localenvs)
+    if (( globalfirst )); then
+        envs=("${globalenvs[@]}" "${localenvs[@]}")
     else
-        envs=($localenvs $globalenvs)
+        envs=("${localenvs[@]}" "${globalenvs[@]}")
     fi
 
-    # unmaned envs (if show-unammed).
-    if test -n "$unnamed"; then
-        envs+=($( (cat ${HOME:?}/.conda/environments.txt) 2>/dev/null | cut -f1 -d' ' | sed -e "s|^${PWD}|.|" | sed -e "s|^$localenvspath/||"))
+    # unnamed envs (if show-unnamed).
+    if (( unnamed )); then
+        envs+=($( (cat "${HOME:?}/.conda/environments.txt") 2>/dev/null |
+            cut -f1 -d' ' |
+            sed -e "s|^${PWD}|.|" -e "s|^$localenvspath/||"))
     fi
 
-    _describe $describe_opts -t envs 'conda environments' envs
+    _describe "${describe_opts[@]}" -t envs 'conda environment' envs
 }
 
 __conda_packages_installed(){
-    local -a installed_packages option environment additional_message
+    local -a installed_packages conda_list_args
+    local option='' environment='' additional_message=''
     # check for command line overrides
     [[ -n "$1" ]] && option="$1"
     [[ -n "$2" ]] && environment="$2"
-    installed_packages=($( conda list --no-pip $option $environment | sed 1,2d | cut -f1 -d' ' ))
-    [[ -n $option ]] && [[ -n $environment ]] && additional_message=" in environment: '$environment'"
-    _describe -t installed_packages "installed packages$additional_message" installed_packages
+    conda_list_args=(conda list --no-pip)
+    [[ -n $option ]] && conda_list_args+=("$option")
+    [[ -n $environment ]] && conda_list_args+=("$environment")
+    installed_packages=($("${conda_list_args[@]}" 2>/dev/null |
+        sed 1,2d | cut -f1 -d' '))
+    [[ -n $option ]] && [[ -n $environment ]] &&
+        additional_message=" in environment: '$environment'"
+    _describe -t installed_packages \
+        "installed package$additional_message" installed_packages
+}
+
+# Install the 12-hour default cache policy unless the user configured one.
+__conda_is_error_json() {
+    local -a keys
+    keys=("$@")
+    (( ${keys[(I)error]} )) || return 1
+    (( ${keys[(I)exception_name]} )) ||
+        (( ${keys[(I)exception_type]} ))
+}
+
+__conda_set_cache_policy() {
+    local cache_policy=''
+    if ! zstyle -s ":completion:${curcontext}:" cache-policy cache_policy ||
+        [[ -z $cache_policy ]]; then
+        zstyle ":completion:${curcontext}:" cache-policy \
+            __conda_caching_policy
+    fi
 }
 
 __conda_package_available(){
-    zstyle ":completion:${curcontext}:" cache-policy __conda_caching_policy
     local -a available_packages
-    if _cache_invalid conda_available_packages || ! _retrieve_cache conda_available_packages ; then
-        available_packages=($(conda search --use-index-cache --json |
-        python -c "
-import json, sys
-parsed = json.load(sys.stdin)
-try:
-    for k in parsed.keys():
-        print(k)
-except KeyboardInterrupt:
-    pass
-        "))
-        _store_cache conda_available_packages available_packages
+    __conda_set_cache_policy
+    if _cache_invalid conda_available_packages ||
+        ! _retrieve_cache conda_available_packages; then
+        available_packages=($(
+            conda search --use-index-cache --json 2>/dev/null |
+            __conda_json_object_keys 2>/dev/null))
+        if (( ${#available_packages} )) &&
+            ! __conda_is_error_json "${available_packages[@]}"; then
+            _store_cache conda_available_packages available_packages
+        fi
     fi
-    print -l $available_packages
-
+    if __conda_is_error_json "${available_packages[@]}"; then
+        available_packages=()
+    fi
+    if (( ${#available_packages} )); then
+        print -l -r -- "${available_packages[@]}"
+    fi
+    return 0
 }
 
 __describe_conda_package_available(){
     local -a available_packages
     available_packages=($( __conda_package_available))
-    _describe -t available_packages 'available packages' available_packages
+    _describe -t available_packages 'available package' available_packages
 }
 
 __conda_existing_config_keys(){
     local -a config_keys
-    config_keys=($(conda config --json --get |
-        python -c "
-import json, sys
-keys = json.load(sys.stdin)['get'].keys()
-try:
-    for k in keys:
-        print(k)
-except KeyboardInterrupt:
-    pass
-        "))
-    print -l $config_keys
+    config_keys=($(conda config --json --get 2>/dev/null |
+        __conda_json_config_keys 2>/dev/null))
+    if __conda_is_error_json "${config_keys[@]}"; then
+        config_keys=()
+    fi
+    (( ${#config_keys} )) && print -l -r -- "${config_keys[@]}"
+    return 0
 }
 
 __conda_describe_existing_config_keys(){
     local -a config_keys
     config_keys=($( __conda_existing_config_keys ))
-    if [ "${#config_keys}" == 0 ] ; then
+    if [ "${#config_keys}" -eq 0 ] ; then
         _message "no keys found!"
     else
-        _describe -t config_keys 'existing configuration keys' config_keys
+        _describe -t config_keys 'existing configuration key' config_keys
     fi
 }
 
@@ -306,167 +698,481 @@ __conda_describe_existing_list_config_keys(){
     local -a config_keys existing_list_config_keys
     config_keys=($( __conda_existing_config_keys ))
     existing_list_config_keys=()
-    for k in $config_keys; do
+    for k in "${config_keys[@]}"; do
         if (( ${__conda_list_config_keys[(I)$k]} )) ; then
-            existing_list_config_keys+=$k
+            existing_list_config_keys+=("$k")
         fi
     done
-    if [ "${#existing_list_config_keys}" == 0 ] ; then
+    if [ "${#existing_list_config_keys}" -eq 0 ] ; then
         _message "no keys found!"
     else
-        _describe -t existing_list_config_keys 'existing list configuration keys' existing_list_config_keys
+        _describe -t existing_list_config_keys \
+            'existing list configuration key' existing_list_config_keys
     fi
 }
 
 __conda_existing_config_values(){
     local -a config_values search_term
     search_term="$1"
-    config_values=($(conda config --json --get "$search_term" 2> /dev/null |
-        python -c "
-import json, sys
-try:
-    values = json.load(sys.stdin)['get']['$search_term']
-    for v in values:
-        print(v)
-except (KeyError, VlaueError, KeyboardInterrupt):
-    pass
-        "))
-    print -l $config_values
+    config_values=($(conda config --json --get "$search_term" 2>/dev/null |
+        __conda_json_config_values "$search_term" 2>/dev/null))
+    (( ${#config_values} )) && print -l -r -- "${config_values[@]}"
+    return 0
 }
 
 __conda_describe_existing_config_values(){
     local -a config_values search_term
     search_term="$1"
-    config_values=($( __conda_existing_config_values $search_term ))
-    if [ "${#config_values}" == 0 ] ; then
+    config_values=($( __conda_existing_config_values "$search_term" ))
+    if [ "${#config_values}" -eq 0 ] ; then
         _message "no values found for '$search_term'!"
     else
-        _describe -t config_values 'configuration values' config_values
+        # compadd keeps values containing colons (e.g. channel urls) intact.
+        _wanted config_values expl 'configuration value' \
+            compadd -a config_values
     fi
 }
 
 __conda_describe_boolean_config_values(){
     local -a config_values
     config_values=(True False)
-    _describe -t config_values 'boolean configuration values' config_values
+    _describe -t config_values 'boolean configuration value' config_values
 }
 
 __conda_channels(){
     local -a channels
     channels=($( __conda_existing_config_values "channels" ))
     channels+=(system)
-    _describe -t channels 'conda channels' channels
+    _describe -t channels 'conda channel' channels
 }
 
-local -a __conda_boolean_config_keys __conda_list_config_keys __conda_config_keys
+local -a __conda_boolean_config_keys
+local -a __conda_list_config_keys
+local -a __conda_map_config_keys
+local -a __conda_other_config_keys
+local -a __conda_config_keys
 
 __conda_boolean_config_keys=(
-    'add_binstar_token'
-    'always_yes'
+    'add_anaconda_token'
+    'allow_non_channel_urls'
     'allow_softlinks'
+    'always_copy'
+    'always_softlink'
+    'always_yes'
+    'anaconda_upload'
+    'auto_activate_base'
+    'auto_update_conda'
     'changeps1'
-    'use_pip'
+    'envvars_force_uppercase'
+    'extra_safety_checks'
+    'force_reinstall'
+    'json'
+    'no_lock'
+    'no_plugins'
+    'non_admin_enabled'
+    'notify_outdated_conda'
     'offline'
-    'binstar_upload'
-    'binstar_personal'
+    'override_channels_enabled'
+    'pip_interop_enabled'
+    'quiet'
+    'repodata_use_zst'
+    'report_errors'
+    'restore_free_channel'
+    'rollback_enabled'
+    'separate_format_cache'
+    'shortcuts'
     'show_channel_urls'
-    'allow_other_channels'
     'ssl_verify'
+    'unsatisfiable_hints'
+    'use_only_tar_bz2'
     )
 
 __conda_list_config_keys=(
+    'aggressive_update_packages'
+    'allowlist_channels'
     'channels'
-    'disallow'
     'create_default_packages'
-    'track_features'
+    'default_channels'
+    'denylist_channels'
+    'disallowed_packages'
     'envs_dirs'
+    'experimental'
+    'migrated_channel_aliases'
+    'pinned_packages'
+    'pkgs_dirs'
+    'repodata_fns'
+    'shortcuts_only'
+    'track_features'
     )
 
-__conda_config_keys=($__conda_boolean_config_keys $__conda_list_config_keys)
+__conda_map_config_keys=(
+    'channel_settings'
+    'conda_build'
+    'custom_channels'
+    'custom_multichannels'
+    'migrated_custom_channels'
+    'proxy_servers'
+    )
+
+__conda_other_config_keys=(
+    'auto_stack'
+    'bld_path'
+    'channel_alias'
+    'channel_priority'
+    'client_ssl_cert'
+    'client_ssl_cert_key'
+    'console'
+    'croot'
+    'default_threads'
+    'env_prompt'
+    'execute_threads'
+    'fetch_threads'
+    'local_repodata_ttl'
+    'number_channel_notices'
+    'path_conflict'
+    'remote_backoff_factor'
+    'remote_connect_timeout_secs'
+    'remote_max_retries'
+    'remote_read_timeout_secs'
+    'repodata_threads'
+    'safety_checks'
+    'signing_metadata_url_base'
+    'solver'
+    'unsatisfiable_hints_check_depth'
+    'verbosity'
+    'verify_threads'
+    )
+
+__conda_config_keys=(
+    "${__conda_boolean_config_keys[@]}"
+    "${__conda_list_config_keys[@]}"
+    "${__conda_map_config_keys[@]}"
+    "${__conda_other_config_keys[@]}"
+    )
 
 __conda_describe_boolean_config_keys(){
-    _describe -t __conda_boolean_config_keys 'boolean keys' __conda_boolean_config_keys
+    _describe -t __conda_boolean_config_keys \
+        'boolean configuration key' __conda_boolean_config_keys
 }
 
 __conda_describe_list_config_keys(){
-    _describe -t __conda_list_config_keys 'list keys' __conda_list_config_keys
+    _describe -t __conda_list_config_keys \
+        'list configuration key' __conda_list_config_keys
 }
 
 __conda_describe_config_keys(){
-    _describe -t __conda_config_keys 'conda configuration keys' __conda_config_keys
+    _describe -t __conda_config_keys \
+        'conda configuration key' __conda_config_keys
+}
+
+# All keys known to the current conda, including context parameters that
+# --show and --describe accept but that are not part of the user schema.
+__conda_all_config_keys(){
+    local -a config_keys
+    config_keys=($(conda config --show --json 2>/dev/null |
+        __conda_json_object_keys 2>/dev/null))
+    if __conda_is_error_json "${config_keys[@]}"; then
+        config_keys=()
+    fi
+    if (( ! ${#config_keys} )); then
+        config_keys=("${__conda_config_keys[@]}")
+    fi
+    (( ${#config_keys} )) && print -l -r -- "${config_keys[@]}"
+    return 0
+}
+
+# --set only accepts primitive keys; list and map keys use --append/--prepend.
+__conda_settable_config_keys(){
+    local -a config_keys settable_keys
+    local k
+    config_keys=($( __conda_all_config_keys ))
+    settable_keys=()
+    for k in "${config_keys[@]}"; do
+        if (( ! ${__conda_list_config_keys[(I)$k]} )) &&
+            (( ! ${__conda_map_config_keys[(I)$k]} )); then
+            settable_keys+=("$k")
+        fi
+    done
+    (( ${#settable_keys} )) && print -l -r -- "${settable_keys[@]}"
+    return 0
+}
+
+__conda_describe_all_config_keys(){
+    local -a config_keys
+    config_keys=($( __conda_all_config_keys ))
+    if (( ${#config_keys} )); then
+        _describe -t config_keys 'configuration key' config_keys
+    else
+        _message "no configuration keys found"
+    fi
+}
+
+__conda_describe_settable_config_keys(){
+    local -a config_keys
+    config_keys=($( __conda_settable_config_keys ))
+    if (( ${#config_keys} )); then
+        _describe -t config_keys 'configuration key' config_keys
+    else
+        _message "no configuration keys found"
+    fi
+}
+
+__conda_current_config_value(){
+    conda config --show "$1" 2>/dev/null |
+        sed -n "s/^$1: //p" | head -n 1
+}
+
+__conda_describe_config_set_values(){
+    local key="$1"
+    local value=''
+    local -a config_values
+    if (( ${__conda_boolean_config_keys[(I)$key]} )); then
+        __conda_describe_boolean_config_values
+        return 0
+    fi
+    case $key in
+    (channel_priority)
+        config_values=(strict flexible disabled)
+        ;;
+    (path_conflict)
+        config_values=(clobber warn prevent)
+        ;;
+    (safety_checks)
+        config_values=(enabled warn disabled)
+        ;;
+    (solver)
+        config_values=(classic libmamba)
+        ;;
+    esac
+    if (( ! ${#config_values} )); then
+        value=$( __conda_current_config_value "$key" )
+        if [[ $value == (True|False) ]]; then
+            __conda_describe_boolean_config_values
+            return 0
+        fi
+        [[ -n $value ]] && config_values=("$value")
+    fi
+    if (( ${#config_values} )); then
+        _wanted config_values expl 'configuration value' \
+            compadd -a config_values
+    else
+        _message "no predefined values for '$key'"
+    fi
 }
 
 #__conda_package_specs=('<'  '>' '<=' '>=' '==' '!=')
 __conda_package_specs=('=')
 
 __conda_describe_package_specs(){
-    _describe -t __conda_package_specs 'conda package specs' __conda_package_specs
+    _describe -t __conda_package_specs \
+        'conda package spec' __conda_package_specs
 }
 
 __conda_describe_package_version(){
-    local -a current_package versions
-    current_package="$1"
-    versions=($( conda search --json --use-index-cache $current_package | python -c "
-import json,sys
-try:
-    versions = set((e['version'] for e in json.load(sys.stdin)['$current_package']))
-    for v in versions:
-        print(v)
-except (KeyError, KeyboardInterrupt):
-    pass
-    "))
+    local current_package="$1"
+    # conda search output is large and shell parsing is comparatively slow,
+    # so cache each package's version list like the package list.
+    local cache_name
+    local -a versions
+    __conda_set_cache_policy
+    cache_name="conda_versions_${current_package//[^A-Za-z0-9_.-]/_}"
+    if _cache_invalid "$cache_name" || ! _retrieve_cache "$cache_name"; then
+        versions=($(
+            conda search --json --use-index-cache \
+                "$current_package" 2>/dev/null |
+            __conda_json_package_versions "$current_package" 2>/dev/null))
+        if (( ${#versions} )); then
+            _store_cache "$cache_name" versions
+        fi
+    fi
     _describe -t versions "$current_package version" versions
 }
 
+# Revision numbers for --revision, taken from conda list --revisions.  The
+# plain-text output is used because the JSON form is an array that the
+# embedded query would need another mode to read.
+__conda_revisions(){
+    local -a args revisions
+    local i
+    for (( i = 1; i <= ${#words}; i++ )); do
+        case ${words[i]} in
+        (-n|--name|-p|--prefix)
+            if (( i < ${#words} )) && [[ -n ${words[i+1]} ]]; then
+                args+=("${words[i]}" "${words[i+1]}")
+            fi
+            ;;
+        (--name=*|--prefix=*)
+            args+=("${words[i]}")
+            ;;
+        esac
+    done
+    revisions=($(conda list --revisions "${args[@]}" 2>/dev/null |
+        sed -n 's/^.*(rev \([0-9][0-9]*\)).*$/\1/p'))
+    (( ${#revisions} )) && print -l -r -- "${revisions[@]}"
+    return 0
+}
+
+__conda_describe_revisions(){
+    local -a revisions
+    revisions=($( __conda_revisions ))
+    if (( ${#revisions} )); then
+        _describe -t revisions 'revision' revisions
+    else
+        _message "no revisions found"
+    fi
+}
+
+# Environment variables configured in the target environment (or the active
+# one).  The JSON form is a plain object, so the root object keys are enough.
+__conda_env_config_vars(){
+    local -a args env_vars
+    local i
+    for (( i = 1; i <= ${#words}; i++ )); do
+        case ${words[i]} in
+        (-n|--name|-p|--prefix)
+            if (( i < ${#words} )) && [[ -n ${words[i+1]} ]]; then
+                args+=("${words[i]}" "${words[i+1]}")
+            fi
+            ;;
+        (--name=*|--prefix=*)
+            args+=("${words[i]}")
+            ;;
+        esac
+    done
+    env_vars=($(conda env config vars list --json "${args[@]}" 2>/dev/null |
+        __conda_json_object_keys 2>/dev/null))
+    if __conda_is_error_json "${env_vars[@]}"; then
+        env_vars=()
+    fi
+    (( ${#env_vars} )) && print -l -r -- "${env_vars[@]}"
+    return 0
+}
+
+__conda_describe_env_config_vars(){
+    local -a env_vars
+    env_vars=($( __conda_env_config_vars ))
+    if (( ${#env_vars} )); then
+        _describe -t env_config_vars 'environment variable' env_vars
+    else
+        _message "no environment variables found"
+    fi
+}
+
+__conda_env_config_var_value(){
+    local name="$1"
+    local -a args values
+    local i
+    [[ $name == ([A-Za-z_][A-Za-z0-9_]*) ]] || return 0
+    for (( i = 1; i <= ${#words}; i++ )); do
+        case ${words[i]} in
+        (-n|--name|-p|--prefix)
+            if (( i < ${#words} )) && [[ -n ${words[i+1]} ]]; then
+                args+=("${words[i]}" "${words[i+1]}")
+            fi
+            ;;
+        (--name=*|--prefix=*)
+            args+=("${words[i]}")
+            ;;
+        esac
+    done
+    values=("${(@f)$(conda env config vars list "${args[@]}" 2>/dev/null |
+        sed -n "s/^${name} = //p")}")
+    values=("${(@)values:#}")
+    (( ${#values} )) && print -l -r -- "${values[@]}"
+    return 0
+}
+
+__conda_describe_env_config_var_value(){
+    local name="$1"
+    local -a values
+    values=("${(@f)$( __conda_env_config_var_value "$name" )}")
+    values=("${(@)values:#}")
+    if (( ${#values} )); then
+        _wanted env_config_values expl 'environment variable value' \
+            compadd -a values
+    fi
+}
+
+__conda_describe_env_config_var_assignments(){
+    local -a env_vars
+    if compset -P '*='; then
+        __conda_describe_env_config_var_value "${IPREFIX[1,-2]}"
+        return 0
+    fi
+    env_vars=($( __conda_env_config_vars ))
+    if (( ${#env_vars} )); then
+        _describe -t env_config_vars 'environment variable' env_vars -S '='
+    else
+        _message "no environment variables found"
+    fi
+}
+
 __conda_commands(){
-    local -a package maint environment help config special tmp
+    local -a package maint environment config special external
     package=(
-        search:'Search for packages and display their information.'
-        install:'Install a list of packages into a specified conda environment.'
+        search:'search for packages and display associated information'
+        install:'install a list of packages into a specified conda environment'
+        repoquery:'search repodata for package dependencies'
     )
     maint=(
-        update:'Update conda packages.'
-        clean:'Remove unused packages and caches.'
+        update:'update conda packages to the latest compatible version'
+        upgrade:'alias for update'
+        clean:'remove unused packages and caches'
+        index:'update package index metadata files'
     )
     environment=(
-        info:'Display information about current conda install.'
-        create:'Create a new conda environment from a list of specified packages.'
-        list:'List linked packages in a conda environment.'
-        remove:'Remove a list of packages from a specified conda environment.'
-        uninstall:'Alias for conda remove'
-        activate:'Activate an environment; alias for source activate'
-        deactivate:'Deactivate an environment; alias for source deactivate'
-    )
-    help=(
-        help:'Displays a list of available conda commands and their help strings.'
+        info:'display information about current conda install'
+        create:'create a new conda environment from specified packages'
+        list:'list installed packages in a conda environment'
+        remove:'remove a list of packages from a specified conda environment'
+        uninstall:'alias for remove'
+        rename:'rename an existing environment'
+        export:'export a given environment'
+        compare:'compare packages between conda environments'
+        doctor:'display a health report for your environment'
+        activate:'activate a conda environment'
+        deactivate:'deactivate the current active conda environment'
+        pack:'package an existing environment into an archive'
+        develop:'install a python package in development mode'
     )
     config=(
-        config:'Modify configuration values in .condarc.'
+        config:'modify configuration values in .condarc'
+        content-trust:'sign and verify conda metadata'
+        token:'configure token access for anaconda commercial edition'
     )
     special=(
-        run:'Launches an application installed with Conda.'
-        init:'Initialize conda into a regular environment. (EXPERIMENTAL)'
-        package:'Low-level conda package utility. (EXPERIMENTAL)'
-        bundle:'Create or extract a "bundle package" (EXPERIMENTAL)'
+        run:'run an executable in a conda environment'
+        init:'initialize conda for shell interaction'
+        package:'create low-level conda packages (EXPERIMENTAL)'
+        commands:'list all available conda subcommands'
+        notices:'retrieve latest channel notifications'
+        convert:'convert pure python packages to other platforms'
+        debug:'set up environments to debug a build or test phase'
+        inspect:'inspect conda packages'
+        metapackage:'create a conda metapackage'
+        render:'expand a recipe into a platform-specific recipe'
+        skeleton:'generate a boilerplate conda recipe'
+        root:'run the top-level conda command'
     )
     external=(
-        env:'Manage environments.'
-        build:'tool for building conda packages'
+        env:'manage environments'
+        build:'build conda packages from a conda recipe'
+        repo:'manage an anaconda repository'
+        server:'manage an anaconda repository server'
         )
 
     # This takes care of alignment if the user wanted the subcommand completion
     # to be split into groups.
-    zstyle -s ":conda_zsh_completion:*" use-groups tmp
-    if [[ -n $tmp ]] ; then
-        _describe -t package_commands "package commands" package
-        _describe -t maint_commands "maint commands" maint
-        _describe -t environment_commands "environment commands" environment
-        _describe -t help_commands "help commands"  help
-        _describe -t config_commands "config commands"  config
-        _describe -t special_commands "special commands"  special
-        _describe -t external_commands "external commands"  external
+    if zstyle -t ":conda_zsh_completion:*" use-groups; then
+        _describe -t package_commands "package command" package
+        _describe -t maint_commands "maint command" maint
+        _describe -t environment_commands "environment command" environment
+        _describe -t config_commands "config command" config
+        _describe -t special_commands "special command" special
+        _describe -t external_commands "external command" external
     else
-        _describe "conda commands" package -- maint -- environment -- help -- config -- special -- external
+        _describe "conda command" package -- maint -- environment \
+            -- config -- special -- external
     fi
 }
 
@@ -477,9 +1183,13 @@ __conda_caching_policy() {
 }
 
 local -a opts help_opts json_opts env_opts channel_opts install_opts
+local -a output_opts net_opts env_export_opts install_extra_opts
+local -a repodata_opts build_common_opts skeleton_opts
 
 opts=(
     '(-h --help)'{-h,--help}'[show this help message and exit]'
+    '(-v --verbose)'{-v,--verbose}'[increase output verbosity (repeat for more detail)]'
+    '--no-plugins[disable all plugins that are not built into conda]'
     '(-V --version)'{-V,--version}'[show program''s version number and exit]'
 )
 
@@ -487,8 +1197,59 @@ help_opts=(
     '(-h --help)'{-h,--help}'[show this help message and exit]' \
     )
 
+output_opts=(
+    '(-q --quiet)'{-q,--quiet}'[do not display progress bar]' \
+    '(-v --verbose)'{-v,--verbose}'[increase output verbosity (repeat for more detail)]' \
+    '--console[select the backend for normal output rendering]:console:' \
+    )
+
 json_opts=(
-    '--json[report all output as json.]' \
+    '--json[report all output as json]' \
+    )
+
+net_opts=(
+    '(-C --use-index-cache)'{-C,--use-index-cache}'[use cache of channel index files]' \
+    '(-k --insecure)'{-k,--insecure}'[allow insecure SSL connections]' \
+    '--offline[offline mode, do not connect to the internet]' \
+    )
+
+# Index options shared by commands that solve or fetch repodata.
+repodata_opts=(
+    '*--repodata-fn[specify repodata file names to download]:repodata file:(repodata.json current_repodata.json)' \
+    '--experimental[enable experimental index features]:feature:(jlap lock)' \
+    '--no-lock[disable locking when reading or updating the index cache]' \
+    '(--no-repodata-use-zst)--repodata-use-zst[check for repodata.json.zst]' \
+    '(--repodata-use-zst)--no-repodata-use-zst[do not check for repodata.json.zst]' \
+    )
+
+# Common conda-build recipe options (debug and render).
+build_common_opts=(
+    '--python[set the python version used by conda build]:version:' \
+    '--perl[set the perl version used by conda build]:version:' \
+    '--numpy[set the numpy version used by conda build]:version:' \
+    '--R[set the R version used by conda build]:version:' \
+    '--lua[set the lua version used by conda build]:version:' \
+    '--append-file[append meta.yaml fields from a file]:file:_files' \
+    '--clobber-file[clobber meta.yaml fields from a file]:file:_files' \
+    '(-m --variant-config-files)'{-m,--variant-config-files}'[additional variant config files]:file:_files' \
+    '(-e --exclusive-config-files --exclusive-config-file)'{-e,--exclusive-config-files,--exclusive-config-file}'[exclusive variant config files]:file:_files' \
+    '--use-channeldata[use channeldata when available]' \
+    '--variants[variants to extend the build matrix]:yaml:' \
+    )
+
+skeleton_opts=(
+    '--output-dir[directory to write recipes to]:directory:_directories' \
+    '--version[version to use for the generated recipe]:version:' \
+    '--recursive[create recipes for dependencies if needed]' \
+    )
+
+env_export_opts=(
+    '(-c --channel)'{-c,--channel}'[additional channel to include in export]:channel:__conda_channels' \
+    '--override-channels[do not include .condarc channels]' \
+    '(-f --file)'{-f,--file}'[file name or path for the exported environment]:environment file:_path_files' \
+    '--no-builds[remove build specifications]' \
+    '--ignore-channels[do not include channel names]' \
+    '--from-history[build environment spec from history]' \
     )
 
 env_opts=(
@@ -498,23 +1259,35 @@ env_opts=(
 
 channel_opts=(
     '(-c --channel)'{-c,--channel}'[additional channel to search for packages]:channel:__conda_channels'\
-    '--override-channels [do not search default or .condarc channels]' \
-    '--use-index-cache[use cache of channel index files]' \
+    '--override-channels[do not search default or .condarc channels]' \
     '--use-local[use locally built packages]' \
     )
 
 install_opts=(
     '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
-    '--dry-run[only display what would have been done]' \
-    '(-f --force)'{-f,--force}'[force install]' \
-    '--file[read package versions from file]:file:_path_files' \
-    '--no-deps[do not install dependencies]' \
-    '(-m --mkdir)'{-m,--mkdir}'[create prefix directory if necessary]' \
-    '--offline[offline mode, don''t connect to internet]' \
+    '(-d --dry-run)'{-d,--dry-run}'[only display what would have been done]' \
+    '--file[read package versions from file]:package versions file:_path_files' \
+    '(--only-deps)--no-deps[do not install dependencies]' \
+    '(--no-deps)--only-deps[only install dependencies]' \
     '--no-pin[ignore pinned file]' \
-    '(-q --quiet)'{-q,--quiet}'[do not display progress bar]'\
-    '--copy[Install all packages using copies instead of hard- or soft-linking]' \
-    '--alt-hint[Use an alternate algorithm to generate an unsatisfiable hint]' \
+    '--copy[install all packages using copies instead of hard- or soft-linking]' \
+    '--dev[use sys.executable -m conda in wrapper scripts]' \
+    '--solver[choose the solver backend]:solver:(classic libmamba)' \
+    '--strict-channel-priority[use strict channel priority]' \
+    '--no-channel-priority[use flexible channel priority]' \
+    '--no-shortcuts[do not install start menu shortcuts]' \
+    '--shortcuts-only[install only the named start menu shortcuts]:shortcut:' \
+    '--download-only[solve and download packages without installing]' \
+    '--show-channel-urls[show channel urls]' \
+    )
+
+install_extra_opts=(
+    '--force-reinstall[ensure requested packages are reinstalled]' \
+    '--freeze-installed[freeze installed packages]' \
+    '--no-update-deps[alias for --freeze-installed]' \
+    '--update-deps[update dependencies that have updates]' \
+    '(-S --satisfied-skip-solve)'{-S,--satisfied-skip-solve}'[skip solve if requirements are satisfied]' \
+    '--clobber[allow clobbering overlapping file paths]' \
     )
 
 _arguments -C $opts \
@@ -523,15 +1296,17 @@ _arguments -C $opts \
 
 # the magic function, complete either a package or a package and it's version
 __magic(){
-    local -a last_item available_packages current_package
+    local -a available_packages
+    local last_item current_package
     last_item=$line[$CURRENT]
     available_packages=($( __conda_package_available ))
     if compset -P "*=" ; then
         current_package="$IPREFIX[1,-2]"
-        __conda_describe_package_version $current_package
+        __conda_describe_package_version "$current_package"
     else
         __describe_conda_package_available
-        if [[ -n $last_item ]] && (( ${available_packages[(I)$last_item]} )); then
+        if [[ -n $last_item ]] &&
+            (( ${available_packages[(I)$last_item]} )); then
             compset -P '*'
             __conda_describe_package_specs
         fi
@@ -546,39 +1321,44 @@ case $state in
     case ${line[1]} in
     (info)
         _arguments -C $help_opts \
-                      '--json[report all output as json.]' \
-                      '(-a --all)'{-a,--all}'[show all information, (environments, license, and system information]' \
+                      $json_opts \
+                      $output_opts \
+                      '(-a --all)'{-a,--all}'[show all information]' \
+                      '--base[display base environment path]' \
                       '(-e --envs)'{-e,--envs}'[list all known conda environments]' \
-                      '(-l --license)'{-l,--license}'[display information about local conda licenses list]' \
                       '(-s --system)'{-s,--system}'[list environment variables]' \
-                      '--root[display root environment path]' \
-        ;;
-    (help)
-        _arguments -C $help_opts \
-                      '*:commands:__conda_commands' \
+                      '--unsafe-channels[display channels with tokens exposed]' \
         ;;
     (list)
         _arguments -C $help_opts \
                       $env_opts \
                       $json_opts \
+                      $output_opts \
+                      '--show-channel-urls[show channel urls]' \
+                      '--reverse[list installed packages in reverse order]' \
                       '(-c --canonical)'{-c,--canonical}'[output canonical names of packages only]' \
-                      '(-e --export)'{-e,--export}'[output requirement string only]' \
-                      '(-r --revisions)'{-r,--revision}'[list the revision history and exit]' \
-                      '--no-pip[Do not include pip-only installed packages]' \
+                      '(-f --full-name)'{-f,--full-name}'[only match full package names]' \
+                      '--explicit[list explicit package urls]' \
+                      '--md5[add MD5 hashes to explicit output]' \
+                      '--sha256[add SHA256 hashes to explicit output]' \
+                      '(-e --export)'{-e,--export}'[output explicit machine-readable requirements]' \
+                      '(-r --revisions)'{-r,--revisions}'[list revision history]' \
+                      '--no-pip[do not include pip-only installed packages]' \
+                      '--auth[keep authentication details in explicit urls]' \
                       '*:regex:' \
         ;;
     (search)
         _arguments -C $help_opts \
-                      $env_opts \
                       $json_opts \
+                      $output_opts \
                       $channel_opts \
-                      '(-c --canonical)'{-c,--canonical}'[output canonical names of packages only]' \
-                      '--unknown[use index metadata from the local package cache]' \
-                      '(-o --outdated)'{-o,--outdated}'[only display installed but outdated packages]' \
-                      '(-v --verbose)'{-v,--verbose}'[Show available packages as blocks of data]' \
-                      '--platform[Search the given platform.]' \
-                      '--spec[Treat regex argument as a package specification]' \
-                      '(-i --info)'{-v,--verbose}'[Provide detailed information about each package.]' \
+                      $net_opts \
+                      $repodata_opts \
+                      '--envs[search all environments]' \
+                      '(-i --info)'{-i,--info}'[provide detailed information about each package]' \
+                      '--subdir[search the given subdir]:subdir:' \
+                      '--platform[search the given subdir]:subdir:' \
+                      '--skip-flexible-search[do not perform a flexible search]' \
                       '*:regex:' \
         ;;
     (create)
@@ -587,21 +1367,34 @@ case $state in
                       $install_opts \
                       $json_opts \
                       $channel_opts \
-                      '--unknown[use index metadata from the local package cache]' \
-                      '--clone[path to (or name of) existing local environment]' \
-                      '--no-default-packages[ignore create_default_packages in condarc file]' \
+                      $net_opts \
+                      $repodata_opts \
+                      $output_opts \
+                      '(-m --mkdir)'{-m,--mkdir}'[create prefix directory if necessary]' \
+                      '--clone[clone an existing environment]:environment:__conda_envs' \
+                      '--no-default-packages[ignore create_default_packages in condarc]' \
+                      '--subdir[use packages for the given platform]:subdir:' \
+                      '--platform[use packages for the given platform]:subdir:' \
                       '*:packages:__magic' \
         ;;
     (install)
         _arguments -C $help_opts \
                     $env_opts \
                     $install_opts \
+                    $install_extra_opts \
                     $json_opts \
                     $channel_opts \
-                    '--revision[revert to the specified revision]:revision' \
+                    $net_opts \
+                    $repodata_opts \
+                    $output_opts \
+                    '(-m --mkdir)'{-m,--mkdir}'[create prefix directory if necessary]' \
+                    '--revision[revert to the specified revision]:revision:__conda_describe_revisions' \
+                    '--update-all[update all installed packages]' \
+                    '--all[alias for --update-all]' \
+                    '--update-specs[update based on provided specifications]' \
                     '*:packages:__magic' \
         ;;
-    (update)
+    (update|upgrade)
         local -a environment options specifier
         options=('-n' '--name' '-p' '--prefix')
         for i in $options ; do
@@ -611,11 +1404,16 @@ case $state in
         _arguments -C $help_opts \
                       $env_opts \
                       $install_opts \
+                      $install_extra_opts \
                       $json_opts \
                       $channel_opts \
-                      '--unknown[use index metadata from the local package cache]' \
-                      '--all[Update all installed packages in the environment]' \
-                      '*:packages:{__conda_packages_installed $specifier $environment}' \
+                      $net_opts \
+                      $repodata_opts \
+                      $output_opts \
+                      '--update-all[update all installed packages]' \
+                      '--all[alias for --update-all]' \
+                      '--update-specs[update based on provided specifications]' \
+                      '*:packages:{__conda_packages_installed "$specifier" "$environment"}' \
         ;;
     (remove|uninstall)
         local -a environment options specifier
@@ -628,153 +1426,697 @@ case $state in
                       $env_opts \
                       $json_opts \
                       $channel_opts \
+                      $net_opts \
+                      $repodata_opts \
+                      $output_opts \
                       '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
-                      '--dry-run[only display what would have been done]' \
-                      '(-a --all)'{-a,--all}'[remove all packages, i.e. the entire environment]' \
-                      '--features[remove features (instead of packages)]' \
+                      '(-d --dry-run)'{-d,--dry-run}'[only display what would have been done]' \
+                      '(-a --all)'{-a,--all}'[remove all packages including the environment]' \
+                      '--keep-env[keep environment when using --all]' \
+                      '--features[remove features instead of packages]' \
+                      '--force-remove[force removal]' \
+                      '--force[alias for --force-remove]' \
                       '--no-pin[ignore pinned file]' \
-                      '(-q --quiet)'{-q,--quiet}'[do not display progress bar]'\
-                      '--offline[offline mode, don''t connect to internet]' \
-                      '*:packages:{__conda_packages_installed $specifier $environment}' \
+                      '--dev[use sys.executable -m conda in wrapper scripts]' \
+                      '--solver[choose the solver backend]:solver:(classic libmamba)' \
+                      '*:packages:{__conda_packages_installed "$specifier" "$environment"}' \
         ;;
     (config)
         # this allows completing multiple keys when --get is given
         local -a last_item get_opts
         last_item=$line[$CURRENT-1]
-        if (( ${line[(I)--get]} ))  && (( ${__conda_config_keys[(I)$last_item]} )) ; then
+        if (( ${line[(I)--get]} )) &&
+            (( ${__conda_config_keys[(I)$last_item]} )); then
             get_opts=('*:keys:__conda_describe_existing_config_keys')
         else
             get_opts=''
         fi
         _arguments -C $help_opts \
                       $json_opts \
-                      '--system[write to the system .condarc file]' \
-                      '--file[write to the given file.]:file:_path_files' \
-                      '(      --add --set --remove --remove-key)--get[get the configuration value]:key:__conda_describe_existing_config_keys' \
-                      '(--get       --set --remove --remove-key)--add[add one configuration value to a list key]:list key:__conda_describe_list_config_keys:value:' \
-                      '(--get --add       --remove --remove-key)--set[set a boolean key]:boolean key:__conda_describe_boolean_config_keys:value:__conda_describe_boolean_config_values' \
-                      '(--get --add --set          --remove-key)--remove[remove a configuration value from a list key]:list key:__conda_describe_existing_list_config_keys:value:{__conda_describe_existing_config_values '$last_item'}' \
-                      '(--get --add --set --remove             )--remove-key[remove a configuration key (and all its values)]:key:__conda_describe_existing_config_keys' \
-                      '(-f --force)'{-f,--force}'[write to the config file using the yaml parser]' \
+                      $output_opts \
+                      '(--env --file)--system[write to the system .condarc file]' \
+                      '(--system --file)--env[write to the active environment .condarc file]' \
+                      '(--system --env)--file[write to the given file]:config file:_path_files' \
+                      '--show[display configuration values]:*:configuration key:__conda_describe_all_config_keys' \
+                      '--show-sources[display all identified configuration sources]' \
+                      '--validate[validate all configuration sources]' \
+                      '--describe[describe configuration parameters]:*:configuration key:__conda_describe_all_config_keys' \
+                      '--write-default[write the default configuration to a file]' \
+                      '(      --append --prepend --add --set --remove --remove-key --stdin --show --show-sources --validate --describe --write-default)--get[get the configuration value]:key:__conda_describe_existing_config_keys' \
+                      '(--get --prepend --add --set --remove --remove-key --stdin)--append[add one configuration value to the end of a list key]:list key:__conda_describe_list_config_keys:value:{__conda_describe_existing_config_values "$last_item"}' \
+                      '(--get --append --add --set --remove --remove-key --stdin)--prepend[add one configuration value to the beginning of a list key]:list key:__conda_describe_list_config_keys:value:{__conda_describe_existing_config_values "$last_item"}' \
+                      '(--get --append --prepend --set --remove --remove-key --stdin)--add[alias for --prepend]:list key:__conda_describe_list_config_keys:value:{__conda_describe_existing_config_values "$last_item"}' \
+                      '(--get --append --prepend --add --remove --remove-key --stdin)--set[set a boolean or string key]:configuration key:__conda_describe_settable_config_keys:value:{__conda_describe_config_set_values "$last_item"}' \
+                      '(--get --append --prepend --add --set --remove-key --stdin)--remove[remove a configuration value from a list key]:list key:__conda_describe_existing_list_config_keys:value:{__conda_describe_existing_config_values "$last_item"}' \
+                      '(--get --append --prepend --add --set --remove --stdin)--remove-key[remove a configuration key and all its values]:key:__conda_describe_existing_config_keys' \
+                      '(--get --append --prepend --add --set --remove --remove-key)--stdin[apply configuration from yaml on stdin]' \
                       $get_opts
         ;;
     (init)
         _arguments -C $help_opts \
+                      $json_opts \
+                      $output_opts \
+                      '--all[initialize all available shells]' \
+                      '(-d --dry-run)'{-d,--dry-run}'[only display what would have been done]' \
+                      '--user[initialize conda for the current user]' \
+                      '--no-user[do not initialize conda for the current user]' \
+                      '--system[initialize conda for all users]' \
+                      '--reverse[undo the effects of the last conda init]' \
+                      '*:shell:(bash fish powershell tcsh xonsh zsh)' \
         ;;
     (clean)
         _arguments -C $help_opts \
                       $json_opts \
+                      $output_opts \
                       '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
-                      '--dry-run[only display what would have been done]' \
+                      '(-d --dry-run)'{-d,--dry-run}'[only display what would have been done]' \
+                      '(-a --all)'{-a,--all}'[remove all unused packages and caches]' \
                       '(-i --index-cache)'{-i,--index-cache}'[remove index cache]' \
-                      '(-l --lock)'{-l,--lock}'[remove all conda lock files]' \
-                      '(-t --tarballs)'{-t,--tarballs}'[remove cached package tarballs]' \
                       '(-p --packages)'{-p,--packages}'[remove unused cached packages]' \
-                      '(-s --source-cache)'{-s,--source-cache}'[remove files from the source cache of conda build]' \
+                      '(-t --tarballs)'{-t,--tarballs}'[remove cached package tarballs]' \
+                      '(-f --force-pkgs-dirs)'{-f,--force-pkgs-dirs}'[remove all writable package caches]' \
+                      '(-c --tempfiles)'{-c,--tempfiles}'[remove temporary files]:: :_path_files' \
+                      '(-l --logfiles)'{-l,--logfiles}'[remove log files]' \
+                      '*:environment path:_path_files' \
         ;;
     (package)
         _arguments -C $help_opts \
                       $env_opts \
-                      '(-w --which)'{-w,--which}'[given some path print which conda package the file came from]:path:_path_files' \
-                      '(-L --ls-files)'{-L,--ls-files}'[list all files belonging to specified package]' \
+                      '(-w --which)'{-w,--which}'[print which conda package the given file came from]:file:_path_files' \
                       '(-r --reset)'{-r,--reset}'[remove all untracked files and exit]' \
                       '(-u --untracked)'{-u,--untracked}'[display all untracked files and exit]' \
                       '--pkg-name[package name of the created package]:pkg_name:' \
                       '--pkg-version[package version of the created package]:pkg_version:' \
                       '--pkg-build[package build number of the created package]:pkg_build:' \
-        ;;
-    (bundle)
-        _arguments -C $help_opts \
-                      $env_opts \
-                      $json_opts \
-                      '(-c --create)'{-c,--create}'[create bundle]' \
-                      '(-x --extract)'{-x,--extract}'[extact bundle located at path]:path:_path_files' \
-                      '--metadump[dump metadata of bundle at path]:path:_path_files' \
-                      '(-q --quiet)'{-q,--quiet}'[do not display progress bar]'\
-                      '--bundle-name[name of bundle]:NAME:' \
-                      '--data-path[path to data to be included in bundle]:path:_path_files' \
-                      '--extra-meta[path to json file with additional meta-data no]:path:_path_files' \
-                      '--no-env[no environment]' \
+                      '*:file:_path_files' \
         ;;
     (build)
         _arguments -C $help_opts \
-                     '(-c --check)'{-c,--check}'[only check (validate) the recipe]' \
-                     '--no-binstar-upload[do not ask to upload the package to binstar]' \
-                     '--output[output the conda package filename which would have been created and exit]' \
-                     '(-s --source)'{-s,--source}'[only obtain the source (but don''t build)]' \
-                     '(-t --test)'{-t,--test}'[test package (assumes package is already build)]' \
+                     $channel_opts \
+                     '--check[only check the recipe]' \
+                     '(-n --no-source)'{-n,--no-source}'[do not obtain source when templating fails]' \
+                     '--no-anaconda-upload[do not ask to upload the package to anaconda.org]' \
+                     '--no-include-recipe[do not include the recipe in the built package]' \
+                     '--output[output the package filename that would be created]' \
+                     '(-s --source)'{-s,--source}'[only obtain the source]' \
+                     '(-t --test)'{-t,--test}'[test package assuming it is already built]' \
                      '--no-test[do not test the package]' \
-                     '(-b --build-only)'{-b,--build-only}'[only run the build, without any post processing or testing]' \
-                     '(-p --post)'{-p,--post}'[run the post-build logic]' \
-                     '(-V --version)'{-V,--version}'[show program''s version number and exit]' \
+                     '(-b --build-only)'{-b,--build-only}'[only run the build]' \
+                     '--post[run the post-build logic]' \
+                     '(-p --test-run-post)'{-p,--test-run-post}'[run post-build logic during testing]' \
+                     '--skip-existing[skip recipes that already exist]' \
+                     '--keep-old-work[keep build and test environments]' \
+                     '--dirty[do not remove the work directory or build environment]' \
+                     '(-k --keep-going)'{-k,--keep-going}'[keep going after test failures]' \
+                     '(-V --version)'{-V,--version}'[show the conda-build version and exit]' \
                      '(-q --quiet)'{-q,--quiet}'[do not display progress bar]' \
-                     '--python[Set the Python version used by conda build]' \
-                     '--perl[Set the Perl version used by conda build]' \
-                     '--numpy[Set the NumPy version used by conda build]' \
+                     '--debug[show debug output]' \
+                     '--use-channeldata[use channeldata when available]' \
+                     '--token[token for anaconda upload]:token:' \
+                     '--user[user or organization for anaconda upload]:user:' \
+                     '--label[label for anaconda upload]:label:' \
+                     '--no-force-upload[disable force upload to anaconda.org]' \
+                     '--python[set the Python version used by conda build]:version:' \
+                     '--perl[set the Perl version used by conda build]:version:' \
+                     '--numpy[set the NumPy version used by conda build]:version:' \
+                     '--R[set the R version used by conda build]:version:' \
+                     '--lua[set the Lua version used by conda build]:version:' \
                      '*:recipe_path:_path_files' \
         ;;
     (env)
-        _arguments -C $opts \
+        _arguments -C $help_opts \
                       ': :->command' \
                       '*:: :->subcmd'
         case $state in
         (command)
             local -a env
             env=(
-                create:'Create an environment based on an environment file'
-                export:'Export a given environment'
-                list:'List the Conda environments'
-                remove:'Remove an environment'
-                update:'Update the current environment based on environment file'
+                config:'configure a conda environment'
+                create:'create an environment from a definition file'
+                export:'export a given environment'
+                list:'list all conda environments'
+                remove:'remove an environment'
+                update:'update the current environment from a file'
                 )
-                _describe -t env_commands "help commands"  env
+            _describe -t env_commands "environment command" env
             ;;
         (subcmd)
             case ${line[1]} in
+                (config)
+                    _arguments -C $help_opts \
+                                  ': :->command' \
+                                  '*:: :->subcmd'
+                    case $state in
+                    (command)
+                        local -a env_config_commands
+                        env_config_commands=(
+                            vars:'interact with environment variables associated with conda environments'
+                        )
+                        _describe -t env_config_commands "environment config command" env_config_commands
+                        ;;
+                    (subcmd)
+                        case ${line[1]} in
+                            (vars)
+                                _arguments -C $help_opts \
+                                              ': :->command' \
+                                              '*:: :->subcmd'
+                                case $state in
+                                (command)
+                                    local -a env_config_var_commands
+                                    env_config_var_commands=(
+                                        list:'list environment variables for a conda environment'
+                                        set:'set environment variables for a conda environment'
+                                        unset:'unset environment variables for a conda environment'
+                                    )
+                                    _describe -t env_config_var_commands "environment variable command" env_config_var_commands
+                                    ;;
+                                (subcmd)
+                                    case ${line[1]} in
+                                        (list)
+                                            _arguments -C $help_opts \
+                                                          $json_opts \
+                                                          $output_opts \
+                                                          $env_opts
+                                            ;;
+                                        (set)
+                                            _arguments -C $help_opts \
+                                                          $env_opts \
+                                                          '*:environment variable:__conda_describe_env_config_var_assignments'
+                                            ;;
+                                        (unset)
+                                            _arguments -C $help_opts \
+                                                          $env_opts \
+                                                          '*:environment variable:__conda_describe_env_config_vars'
+                                            ;;
+                                    esac
+                                    ;;
+                                esac
+                                ;;
+                        esac
+                        ;;
+                    esac
+                    ;;
                 (create)
                     _arguments -C $help_opts \
                                   $json_opts \
+                                  $output_opts \
                                   $env_opts \
-                                  '(-f --file)'{-f,--file}'[environment definition]:file:_path_files' \
-                                  '(-q --quiet)'{-q,--quiet}'[]' \
+                                  $net_opts \
+                                  '(-f --file)'{-f,--file}'[environment definition]:environment file:_path_files' \
+                                  '--no-default-packages[ignore create_default_packages in condarc]' \
+                                  '--solver[choose the solver backend]:solver:(classic libmamba)' \
+                                  '--subdir[use packages for the given platform]:subdir:' \
+                                  '--platform[use packages for the given platform]:subdir:' \
+                                  '(-d --dry-run)'{-d,--dry-run}'[only display what would have been done]' \
+                                  '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
+                                  '*:remote definition:_path_files' \
                     ;;
                 (export)
                     _arguments -C $help_opts \
+                                  $json_opts \
+                                  $output_opts \
                                   $env_opts \
-                                  '(-f --file)'{-f,--file}'[]:file:_path_files' \
+                                  $env_export_opts
                     ;;
                 (list)
                     _arguments -C $help_opts \
                                   $json_opts \
-                                  $env_opts
+                                  $output_opts
                     ;;
                 (remove)
                     _arguments -C $help_opts \
                                   $json_opts \
+                                  $output_opts \
                                   $env_opts \
-                                  '(-q --quiet)'{-q,--quiet}'[do not display progress bar]'\
+                                  '--solver[choose the solver backend]:solver:(classic libmamba)' \
+                                  '(-d --dry-run)'{-d,--dry-run}'[only display what would have been done]' \
                                   '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
-                                  '--dry-run[only display what would have been done]' \
                     ;;
                 (update)
                     _arguments -C $help_opts \
                                   $json_opts \
+                                  $output_opts \
                                   $env_opts \
-                                  '(-f --file)'{-f,--file}'[environment definition]:file:_path_files' \
-                                  '(-q --quiet)'{-q,--quiet}'[]' \
+                                  '(-f --file)'{-f,--file}'[environment definition]:environment file:_path_files' \
+                                  '--prune[remove packages not defined in the environment file]' \
+                                  '--solver[choose the solver backend]:solver:(classic libmamba)' \
+                                  '*:remote definition:_path_files' \
+                    ;;
+            esac
+            ;;
+        esac
+        ;;
+    (run)
+        _arguments -C $help_opts \
+                      $env_opts \
+                      '(-v --verbose)'{-v,--verbose}'[increase output verbosity (repeat for more detail)]' \
+                      '--dev[use python -m conda in wrapper scripts]' \
+                      '--debug-wrapper-scripts[print wrapper script debugging information]' \
+                      '--cwd[current working directory for the command]:directory:_directories' \
+                      '(--no-capture-output)--live-stream[do not capture stdout or stderr]' \
+                      '(--live-stream)--no-capture-output[do not capture stdout or stderr]' \
+                      '*:executable call:' \
+        ;;
+    (rename)
+        _arguments -C $help_opts \
+                      $env_opts \
+                      $json_opts \
+                      $output_opts \
+                      '(-f --force)'{-f,--force}'[force rename]' \
+                      '(-d --dry-run)'{-d,--dry-run}'[only display what would have been done]' \
+                      '(-y --yes)'{-y,--yes}'[do not ask for confirmation]' \
+                      '*:destination:' \
+        ;;
+    (export)
+        _arguments -C $help_opts \
+                      $env_opts \
+                      $env_export_opts \
+                      $json_opts \
+                      $output_opts
+        ;;
+    (compare)
+        _arguments -C $help_opts \
+                      $env_opts \
+                      $json_opts \
+                      $output_opts \
+                      '*:environment file:_path_files' \
+        ;;
+    (doctor)
+        _arguments -C $help_opts \
+                      $env_opts \
+                      '(-v --verbose)'{-v,--verbose}'[increase output verbosity (repeat for more detail)]' \
+        ;;
+    (notices)
+        _arguments -C $help_opts \
+                      $json_opts \
+                      $output_opts \
+                      $repodata_opts \
+                      '(-c --channel)'{-c,--channel}'[additional channel to search for packages]:channel:__conda_channels' \
+                      '--use-local[use locally built packages]' \
+                      '--override-channels[do not search default or .condarc channels]' \
+        ;;
+    (commands)
+        _arguments -C $help_opts
+        ;;
+    (content-trust)
+        _arguments -C $help_opts \
+                      '(-V --version)'{-V,--version}'[show the conda-content-trust version number and exit]' \
+                      ': :->command' \
+                      '*:: :->subcmd'
+        case $state in
+        (command)
+            local -a content_trust_commands
+            content_trust_commands=(
+                gpg-key-lookup:'fetch the ed25519 key for a gpg fingerprint'
+                gpg-sign:'sign a metadata file using gpg'
+                modify-metadata:'modify and sign a metadata file'
+                sign-artifacts:'sign each artifact listed in a repodata file'
+                verify-metadata:'verify a metadata file using a trusted one'
+            )
+            _describe -t content_trust_commands "content trust command" content_trust_commands
+            ;;
+        (subcmd)
+            case ${line[1]} in
+                (sign-artifacts)
+                    _arguments -C $help_opts \
+                                  ':repodata file:_files' \
+                                  ':private key file:_files'
+                    ;;
+                (verify-metadata)
+                    _arguments -C $help_opts \
+                                  ':trusted metadata file:_files' \
+                                  ':untrusted metadata file:_files'
+                    ;;
+                (modify-metadata)
+                    _arguments -C $help_opts \
+                                  ':metadata file:_files'
+                    ;;
+                (gpg-key-lookup)
+                    _arguments -C $help_opts \
+                                  ':gpg key fingerprint:'
+                    ;;
+                (gpg-sign)
+                    _arguments -C $help_opts \
+                                  ':gpg key fingerprint:' \
+                                  ':file:_files'
+                    ;;
+            esac
+            ;;
+        esac
+        ;;
+    (convert)
+        _arguments -C $help_opts \
+                      '(-p --platform)'{-p,--platform}'[platform to convert the packages to]:platform:(osx-64 osx-arm64 linux-32 linux-64 linux-ppc64 linux-ppc64le linux-s390x linux-armv6l linux-armv7l linux-aarch64 win-32 win-64 win-arm64 all)' \
+                      '(-d --dependencies)'{-d,--dependencies}'[additional dependencies of the converted package]:dependency:' \
+                      '--show-imports[show python imports for compiled parts of the package]' \
+                      '(-f --force)'{-f,--force}'[force convert when the package has compiled extensions]' \
+                      '(-o --output-dir)'{-o,--output-dir}'[directory to write the output files]:output directory:_directories' \
+                      '(-v --verbose)'{-v,--verbose}'[print verbose output]' \
+                      '--dry-run[only display what would have been done]' \
+                      '(-q --quiet)'{-q,--quiet}'[do not print as much output]' \
+                      '*:package file:_files' \
+        ;;
+    (debug)
+        _arguments -C $help_opts \
+                      $channel_opts \
+                      $build_common_opts \
+                      $repodata_opts \
+                      '(-V --version)'{-V,--version}'[show the conda-build version number and exit]' \
+                      '(-n --no-source)'{-n,--no-source}'[do not obtain the source when templating fails]' \
+                      '(-p --path)'{-p,--path}'[root path for environments, source and activation script]:directory:_directories' \
+                      '(-o --output-id)'{-o,--output-id}'[fnmatch pattern for the output to create an environment for]:output id:' \
+                      '(-a --activate-string-only)'{-a,--activate-string-only}'[print only the path to the activation script]' \
+                      ':recipe or package file:_files' \
+        ;;
+    (develop)
+        _arguments -C $help_opts \
+                      $env_opts \
+                      '(-npf --no-pth-file)'{-npf,--no-pth-file}'[do not add the source directory to conda.pth]' \
+                      '(-b --build_ext)'{-b,--build_ext}'[build extensions in place]' \
+                      '(-c --clean)'{-c,--clean}'[clean the source directory before building]' \
+                      '(-u --uninstall)'{-u,--uninstall}'[remove the package from development mode]' \
+                      '*:source directory:_directories' \
+        ;;
+    (index)
+        _arguments -C $help_opts \
+                      '--output[write repodata to the given directory]:directory:_directories' \
+                      '--subdir[subdir to index]:subdir:' \
+                      '(-n --channel-name)'{-n,--channel-name}'[channel name to list in index.html]:channel name:' \
+                      '--patch-generator[path to a repodata patch generator]:patch generator:_files' \
+                      '(--no-channeldata)--channeldata[generate channeldata.json]' \
+                      '(--channeldata)--no-channeldata[do not generate channeldata.json]' \
+                      '(--no-rss)--rss[write rss.xml]' \
+                      '(--rss)--no-rss[do not write rss.xml]' \
+                      '(--no-bz2)--bz2[write repodata.json.bz2]' \
+                      '(--bz2)--no-bz2[do not write repodata.json.bz2]' \
+                      '(--no-zst)--zst[write repodata.json.zst]' \
+                      '(--zst)--no-zst[do not write repodata.json.zst]' \
+                      '(--no-run-exports)--run-exports[write run_exports.json]' \
+                      '(--run-exports)--no-run-exports[do not write run_exports.json]' \
+                      '(--no-compact)--compact[output json as one line]' \
+                      '(--compact)--no-compact[pretty-print json output]' \
+                      '(-m --current-index-versions-file)'{-m,--current-index-versions-file}'[yaml file of versions to keep in current_index.json]:file:_files' \
+                      '--base-url[url of the directory tree holding packages]:url:' \
+                      '(--no-current-repodata)--current-repodata[generate current_repodata.json]' \
+                      '(--current-repodata)--no-current-repodata[do not generate current_repodata.json]' \
+                      '--threads[number of threads to use]:threads:' \
+                      '--verbose[enable debug logging]' \
+                      ':channel directory:_directories' \
+        ;;
+    (inspect)
+        _arguments -C $help_opts \
+                      ': :->command' \
+                      '*:: :->subcmd'
+        case $state in
+        (command)
+            local -a inspect_commands
+            inspect_commands=(
+                channels:'inspect a channel and test its packages'
+                hash-inputs:'show the data used to compute package hashes'
+                linkages:'inspect library linkages in a package'
+                objects:'inspect binary object files in a package'
+                prefix-lengths:'find packages with short binary prefixes'
+            )
+            _describe -t inspect_commands "inspect command" inspect_commands
+            ;;
+        (subcmd)
+            case ${line[1]} in
+                (linkages)
+                    _arguments -C $help_opts \
+                                  $env_opts \
+                                  '--untracked[inspect untracked files in the environment]' \
+                                  '--show-files[show files that link to each library]' \
+                                  '--groupby[attribute to group by]:attribute:(package dependency)' \
+                                  '--sysroot[system root for system libraries]:directory:_directories' \
+                                  '--all[report on all packages in the environment]' \
+                                  '*:package:__conda_packages_installed'
+                    ;;
+                (objects)
+                    _arguments -C $help_opts \
+                                  $env_opts \
+                                  '--untracked[inspect untracked files in the environment]' \
+                                  '--groupby[attribute to group by]:attribute:(filename filetype rpath)' \
+                                  '--all[report on all packages in the environment]' \
+                                  '*:package:__conda_packages_installed'
+                    ;;
+                (channels)
+                    _arguments -C $help_opts \
+                                  '--verbose[show verbose output]' \
+                                  '(-t --test-installable)'{-t,--test-installable}'[test every package in the channel]' \
+                                  ':channel:__conda_channels'
+                    ;;
+                (prefix-lengths)
+                    _arguments -C $help_opts \
+                                  '(-m --min-prefix-length)'{-m,--min-prefix-length}'[only show prefixes below this length]:minimum length:' \
+                                  '*:package:_files'
+                    ;;
+                (hash-inputs)
+                    _arguments -C $help_opts \
+                                  '*:package:_files'
+                    ;;
+            esac
+            ;;
+        esac
+        ;;
+    (metapackage)
+        _arguments -C $help_opts \
+                      $channel_opts \
+                      $repodata_opts \
+                      '--no-anaconda-upload[do not ask to upload the package to anaconda.org]' \
+                      '--token[token for anaconda upload]:token:' \
+                      '--user[user or organization for anaconda upload]:user:' \
+                      '--label[label for anaconda upload]:label:' \
+                      '--build-number[build number for the package]:build number:' \
+                      '--build-string[build string for the package]:build string:' \
+                      '(-d --dependencies)'{-d,--dependencies}'[dependencies of the package]:dependency:' \
+                      '--home[homepage for the metapackage]:url:' \
+                      '--license[license of the metapackage]:license:' \
+                      '--summary[summary of the metapackage]:summary:' \
+                      '--entry-points[python entry points to create]:entry point:' \
+                      ':package name:' \
+                      ':package version:' \
+        ;;
+    (pack)
+        _arguments -C $help_opts \
+                      '(-n --name)'{-n,--name}'[name of the environment to pack]:environment:__conda_envs' \
+                      '(-p --prefix)'{-p,--prefix}'[path to the environment to pack]:prefix:_directories' \
+                      '(-o --output)'{-o,--output}'[path of the output archive]:output file:_files' \
+                      '--arcroot[relative path of the environment in the archive]:archive root:' \
+                      '(-d --dest-prefix)'{-d,--dest-prefix}'[prefix to rewrite to in the archive]:destination prefix:_directories' \
+                      '--parcel-root[location where parcels are unpacked]:parcel root:_directories' \
+                      '--parcel-name[name of the parcel]:parcel name:' \
+                      '--parcel-version[version number for the parcel]:parcel version:' \
+                      '--parcel-distro[distribution type for the parcel]:parcel distro:' \
+                      '--format[archive format to use]:format:(infer zip tar.gz tgz tar.bz2 tbz2 tar.xz txz tar parcel squashfs)' \
+                      '--compress-level[compression level from 0 to 9]:compression level:' \
+                      '(-j --n-threads)'{-j,--n-threads}'[number of threads to use]:threads:' \
+                      '--zip-symlinks[store symbolic links in the archive]' \
+                      '--no-zip-64[disable zip64 extensions]' \
+                      '--ignore-editable-packages[skip checks for editable packages]' \
+                      '--ignore-missing-files[skip checks for missing package files]' \
+                      '--exclude[exclude files matching the pattern]:pattern:' \
+                      '--include[re-add excluded files matching the pattern]:pattern:' \
+                      '(-f --force)'{-f,--force}'[overwrite an existing archive]' \
+                      '(-q --quiet)'{-q,--quiet}'[do not report progress]' \
+                      '--version[show the conda-pack version and exit]' \
+        ;;
+    (render)
+        _arguments -C $help_opts \
+                      $channel_opts \
+                      $build_common_opts \
+                      $repodata_opts \
+                      '(-V --version)'{-V,--version}'[show the conda-build version number and exit]' \
+                      '(-n --no-source)'{-n,--no-source}'[do not obtain the source when templating fails]' \
+                      '--output[output the package filename that would be created]' \
+                      '--bootstrap[initial configuration to emulate in the package]:environment:{__conda_envs; _directories}' \
+                      '--old-build-string[disable hash additions to filenames]' \
+                      '(-f --file)'{-f,--file}'[write the rendered recipe to the given file]:file:_files' \
+                      '--verbose[enable verbose output]' \
+                      ':recipe directory:_directories' \
+        ;;
+    (repo)
+        _arguments -C $help_opts
+        ;;
+    (repoquery)
+        _arguments -C $help_opts \
+                      ': :->command' \
+                      '*:: :->subcmd'
+        case $state in
+        (command)
+            local -a repoquery_commands
+            repoquery_commands=(
+                depends:'show dependencies of a package'
+                search:'show all available package versions'
+                whoneeds:'show packages that depend on a package'
+            )
+            _describe -t repoquery_commands "repoquery command" repoquery_commands
+            ;;
+        (subcmd)
+            case ${line[1]} in
+                (depends|whoneeds)
+                    _arguments -C $help_opts \
+                                  $channel_opts \
+                                  $net_opts \
+                                  $repodata_opts \
+                                  $json_opts \
+                                  $output_opts \
+                                  '(-p --platform)'{-p,--platform}'[platform to search packages for]:platform:' \
+                                  '--no-installed[do not search currently installed packages]' \
+                                  '--pretty[print prettier output with more details]' \
+                                  '(-a --all-channels)'{-a,--all-channels}'[search all channels]' \
+                                  '(-t --tree)'{-t,--tree}'[show dependencies in a tree-like format]' \
+                                  '--recursive[show dependencies recursively]' \
+                                  ':package query:'
+                    ;;
+                (search)
+                    _arguments -C $help_opts \
+                                  $channel_opts \
+                                  $net_opts \
+                                  $repodata_opts \
+                                  $json_opts \
+                                  $output_opts \
+                                  '(-p --platform)'{-p,--platform}'[platform to search packages for]:platform:' \
+                                  '--no-installed[do not search currently installed packages]' \
+                                  '--pretty[print prettier output with more details]' \
+                                  '(-a --all-channels)'{-a,--all-channels}'[search all channels]' \
+                                  ':package query:'
+                    ;;
+            esac
+            ;;
+        esac
+        ;;
+    (root)
+        _arguments -C $opts \
+                      ': :->command' \
+                      '*:: :->subcmd'
+        case $state in
+        (command)
+            __conda_commands
+            ;;
+        esac
+        ;;
+    (server)
+        local -a server_opts
+        server_opts=(
+            '(-V --version)'{-V,--version}'[show program''s version number and exit]' \
+            '--disable-ssl-warnings[disable ssl warnings]' \
+            '--show-traceback[show the full traceback for user errors]' \
+            '(-v --verbose)'{-v,--verbose}'[print debug information]' \
+            '(-q --quiet)'{-q,--quiet}'[only show warnings or errors]' \
+            '(-t --token)'{-t,--token}'[authentication token to use]:token:' \
+            '(-s --site)'{-s,--site}'[anaconda-client site to use]:site:' \
+            )
+        _arguments -C $help_opts \
+                      $server_opts \
+                      ': :->command' \
+                      '*:: :->subcmd'
+        case $state in
+        (command)
+            local -a server_commands
+            server_commands=(
+                auth:'manage authorization tokens'
+                channel:'manage repository channels (deprecated)'
+                config:'manage anaconda client configuration'
+                copy:'copy packages between accounts'
+                download:'download notebooks from a repository'
+                groups:'manage groups'
+                label:'manage repository labels'
+                login:'authenticate a user'
+                logout:'log out from a repository'
+                move:'move packages between labels'
+                notebook:'interact with notebooks in a repository'
+                package:'manage packages in a repository'
+                remove:'remove an object from a repository'
+                search:'search a repository'
+                show:'show information about an object'
+                upload:'upload packages to a repository'
+                whoami:'print information about the current user'
+            )
+            _describe -t server_commands "server command" server_commands
+            ;;
+        (subcmd)
+            _arguments -C $help_opts \
+                          $server_opts \
+                          '*: :_files'
+            ;;
+        esac
+        ;;
+    (skeleton)
+        _arguments -C $help_opts \
+                      ': :->command' \
+                      '*:: :->subcmd'
+        case $state in
+        (command)
+            local -a skeleton_commands
+            skeleton_commands=(
+                cpan:'generate a recipe for a cpan package'
+                cran:'generate a recipe for a cran package'
+                luarocks:'generate a recipe for a luarocks package'
+                pypi:'generate a recipe for a pypi package'
+                rpm:'generate a recipe for an rpm package'
+            )
+            _describe -t skeleton_commands "skeleton command" skeleton_commands
+            ;;
+        (subcmd)
+            case ${line[1]} in
+                (cpan|cran|luarocks|pypi|rpm)
+                    _arguments -C $help_opts \
+                                  $skeleton_opts \
+                                  '*:package:'
+                    ;;
+            esac
+            ;;
+        esac
+        ;;
+    (token)
+        _arguments -C $help_opts \
+                      '(-V --version)'{-V,--version}'[show the conda-token version number and exit]' \
+                      ': :->command' \
+                      '*:: :->subcmd'
+        case $state in
+        (command)
+            local -a token_commands
+            token_commands=(
+                list:'list the configured token'
+                remove:'remove the token and revert default_channels'
+                set:'set the token and configure default_channels'
+            )
+            _describe -t token_commands "token command" token_commands
+            ;;
+        (subcmd)
+            case ${line[1]} in
+                (list)
+                    _arguments -C $help_opts
+                    ;;
+                (remove)
+                    _arguments -C $help_opts \
+                                  '(--env --file)--system[write to the system .condarc file]' \
+                                  '(--system --file)--env[write to the active environment .condarc file]' \
+                                  '(--system --env)--file[write to the given file]:config file:_path_files'
+                    ;;
+                (set)
+                    _arguments -C $help_opts \
+                                  '--include-archive-channels[add archived channels to default_channels]:channel:(mro mro-archive free pro)' \
+                                  '--no-ssl-verify[disable ssl verification]' \
+                                  '--enable-signature-verification[enable package signature verification]' \
+                                  '(--env --file)--system[write to the system .condarc file]' \
+                                  '(--system --file)--env[write to the active environment .condarc file]' \
+                                  '(--system --env)--file[write to the given file]:config file:_path_files' \
+                                  ':token:'
                     ;;
             esac
             ;;
         esac
         ;;
     (activate)
-            _arguments -C $help_opts \
-                          '--stack[activate this environment on top of the previous environment]' \
-                          '*:environment:{__conda_envs; _directories}'
-                    ;;
+        _arguments -C $help_opts \
+                      '(--no-stack)--stack[stack the environment on top of the previous environment]' \
+                      '(--stack)--no-stack[do not stack the environment; override auto_stack]' \
+                      '*:environment:{__conda_envs; _directories}'
+        ;;
     (deactivate)
-            _arguments -C $help_opts \
-                    ;;
+        _arguments -C $help_opts \
+        ;;
     esac
     ;;
 esac
